@@ -86,10 +86,6 @@ export default function AppointmentsPage() {
     return () => controller.abort();
   }, [status, departmentId, search, page, load]);
 
-  // ── BUG: the three handlers below update their own slice of state but never
-  // reset `page` back to 1. When the result set shrinks (e.g. filtering from
-  // "All" down to "Completed"), the user stays on whatever page they were on,
-  // which is often beyond the new totalPages and therefore returns 0 rows.
   const handleStatusChange = (value: AppointmentStatus | '') => {
     setStatus(value);
   };
