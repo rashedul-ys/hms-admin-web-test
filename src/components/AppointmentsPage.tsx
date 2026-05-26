@@ -1,30 +1,9 @@
 'use client';
 
-/**
- * TASK 1 — Bug fix
- *
- * This page was working fine until users started filing these reports:
- *
- *   "I filtered by Completed, saw 3 results on page 1. Then I changed to
- *    Scheduled — it jumped straight to page 2 of the scheduled list and
- *    showed nothing, even though there are scheduled appointments."
- *
- *   "Same thing with search. I search for a name, go to page 2, clear
- *    the search — I'm still on page 2 and see fewer rows than expected."
- *
- * Reproduce it:
- *   1. Run the app and go to /appointments
- *   2. Advance to page 2 using the pagination buttons
- *   3. Change the Status or Department filter
- *   4. Notice you stay on page 2 — which is often empty for smaller result sets
- *
- * Fix the bug. Don't change what the filters do — only fix the pagination behaviour.
- */
-
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useReducer, useCallback, useRef } from 'react';
 import { fetchAppointments } from '@/lib/api';
 import { DEPARTMENTS } from '@/lib/mock-data';
-import type { Appointment, AppointmentFilters, AppointmentStatus } from '@/types';
+import type { Appointment, AppointmentFilters, AppointmentStatus, PaginatedResponse } from '@/types';
 
 const STATUS_OPTIONS: { label: string; value: AppointmentStatus | '' }[] = [
   { label: 'All statuses', value: '' },
@@ -47,60 +26,101 @@ const STATUS_STYLES: Record<AppointmentStatus, string> = {
 
 const PAGE_SIZE = 5;
 
+// ─── Filter state ─────────────────────────────────────────────────────────────
+// All filters and page live in one object. Any filter change resets page to 1
+// structurally — there's no way to forget it because setFilter always does it.
+// The production version of this pattern uses URL search params as the source
+// of truth (see RotaOverview) so filters survive a page refresh and are shareable.
+
+interface FilterState {
+  status: AppointmentStatus | '';
+  departmentId: string;
+  search: string;
+  page: number;
+}
+
+type FilterAction =
+  | { type: 'SET_FILTER'; payload: Partial<Omit<FilterState, 'page'>> }
+  | { type: 'SET_PAGE'; payload: number };
+
+const initialFilters: FilterState = {
+  status: '',
+  departmentId: '',
+  search: '',
+  page: 1,
+};
+
+function filterReducer(state: FilterState, action: FilterAction): FilterState {
+  switch (action.type) {
+    case 'SET_FILTER':
+      // Any filter change always resets page — one place, impossible to miss
+      return { ...state, ...action.payload, page: 1 };
+    case 'SET_PAGE':
+      return { ...state, page: action.payload };
+  }
+}
+
+// ─── Component ────────────────────────────────────────────────────────────────
+
+interface LoadState {
+  appointments: Appointment[];
+  pagination: PaginatedResponse<Appointment>['pagination'] | null;
+  isLoading: boolean;
+  error: string | null;
+}
+
 export default function AppointmentsPage() {
-  const [appointments, setAppointments] = useState<Appointment[]>([]);
-  const [total, setTotal]               = useState(0);
-  const [totalPages, setTotalPages]     = useState(1);
-  const [isLoading, setIsLoading]       = useState(false);
-  const [error, setError]               = useState<string | null>(null);
+  const [filters, dispatch] = useReducer(filterReducer, initialFilters);
 
-  // Filter state
-  const [status, setStatus]           = useState<AppointmentStatus | ''>('');
-  const [departmentId, setDepartmentId] = useState('');
-  const [search, setSearch]           = useState('');
-  const [page, setPage]               = useState(1);
+  const [{ appointments, pagination, isLoading, error }, setLoadState] =
+    useReducer(
+      (_: LoadState, next: LoadState) => next,
+      { appointments: [], pagination: null, isLoading: true, error: null },
+    );
 
-  const load = useCallback(
-    async (filters: AppointmentFilters, signal: AbortSignal) => {
-      setIsLoading(true);
-      setError(null);
-      try {
-        const res = await fetchAppointments(filters, signal);
-        setAppointments(res.data);
-        setTotal(res.pagination.total);
-        setTotalPages(res.pagination.totalPages);
-      } catch (err) {
-        if ((err as DOMException).name !== 'AbortError') {
-          setError(err instanceof Error ? err.message : 'Failed to load appointments');
-        }
-      } finally {
-        setIsLoading(false);
-      }
-    },
-    [],
-  );
+  // Debounce search so we don't fire a request on every keystroke
+  const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleSearchChange = useCallback((value: string) => {
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    searchDebounceRef.current = setTimeout(() => {
+      dispatch({ type: 'SET_FILTER', payload: { search: value } });
+    }, 300);
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
-    load({ status: status || undefined, departmentId: departmentId || undefined, search: search || undefined, page, limit: PAGE_SIZE }, controller.signal);
+
+    setLoadState({ appointments: [], pagination: null, isLoading: true, error: null });
+
+    const apiFilters: AppointmentFilters = {
+      status:       filters.status       || undefined,
+      departmentId: filters.departmentId || undefined,
+      search:       filters.search       || undefined,
+      page:         filters.page,
+      limit:        PAGE_SIZE,
+    };
+
+    fetchAppointments(apiFilters, controller.signal)
+      .then(res => {
+        setLoadState({
+          appointments: res.data,
+          pagination:   res.pagination,
+          isLoading:    false,
+          error:        null,
+        });
+      })
+      .catch(err => {
+        if ((err as DOMException).name === 'AbortError') return;
+        setLoadState({
+          appointments: [],
+          pagination:   null,
+          isLoading:    false,
+          error:        err instanceof Error ? err.message : 'Failed to load appointments',
+        });
+      });
+
     return () => controller.abort();
-  }, [status, departmentId, search, page, load]);
-
-  // ── BUG: the three handlers below update their own slice of state but never
-  // reset `page` back to 1. When the result set shrinks (e.g. filtering from
-  // "All" down to "Completed"), the user stays on whatever page they were on,
-  // which is often beyond the new totalPages and therefore returns 0 rows.
-  const handleStatusChange = (value: AppointmentStatus | '') => {
-    setStatus(value);
-  };
-
-  const handleDepartmentChange = (value: string) => {
-    setDepartmentId(value);
-  };
-
-  const handleSearchChange = (value: string) => {
-    setSearch(value);
-  };
+  }, [filters]);
 
   return (
     <div className="space-y-4">
@@ -109,13 +129,13 @@ export default function AppointmentsPage() {
         <input
           type="text"
           placeholder="Search patient name…"
-          value={search}
+          defaultValue={filters.search}
           onChange={e => handleSearchChange(e.target.value)}
           className="border rounded-md px-3 py-2 text-sm w-56 focus:outline-none focus:ring-2 focus:ring-blue-500"
         />
         <select
-          value={status}
-          onChange={e => handleStatusChange(e.target.value as AppointmentStatus | '')}
+          value={filters.status}
+          onChange={e => dispatch({ type: 'SET_FILTER', payload: { status: e.target.value as AppointmentStatus | '' } })}
           className="border rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
         >
           {STATUS_OPTIONS.map(o => (
@@ -123,8 +143,8 @@ export default function AppointmentsPage() {
           ))}
         </select>
         <select
-          value={departmentId}
-          onChange={e => handleDepartmentChange(e.target.value)}
+          value={filters.departmentId}
+          onChange={e => dispatch({ type: 'SET_FILTER', payload: { departmentId: e.target.value } })}
           className="border rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
         >
           <option value="">All departments</option>
@@ -186,18 +206,20 @@ export default function AppointmentsPage() {
 
       {/* Pagination */}
       <div className="flex items-center justify-between text-sm text-gray-600">
-        <span>{total} total · page {page} of {totalPages}</span>
+        <span>
+          {pagination ? `${pagination.total} total · page ${pagination.page} of ${pagination.totalPages}` : ''}
+        </span>
         <div className="flex gap-2">
           <button
-            onClick={() => setPage(p => Math.max(1, p - 1))}
-            disabled={page <= 1 || isLoading}
+            onClick={() => dispatch({ type: 'SET_PAGE', payload: filters.page - 1 })}
+            disabled={filters.page <= 1 || isLoading}
             className="px-3 py-1.5 border rounded-md disabled:opacity-40 hover:bg-gray-50"
           >
             Previous
           </button>
           <button
-            onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-            disabled={page >= totalPages || isLoading}
+            onClick={() => dispatch({ type: 'SET_PAGE', payload: filters.page + 1 })}
+            disabled={!pagination?.hasNextPage || isLoading}
             className="px-3 py-1.5 border rounded-md disabled:opacity-40 hover:bg-gray-50"
           >
             Next
